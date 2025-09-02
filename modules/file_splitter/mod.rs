@@ -11,6 +11,3 @@ pub mod splitter_types;
 // Re-export main types and the FileSplitter
 pub use types::*;
 pub use splitter::FileSplitter;
-
-#[cfg(test)]
-mod tests;

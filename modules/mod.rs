@@ -16,5 +16,12 @@ pub use file_discovery::{FileDiscovery, FileInfo};
 pub use file_splitter::{FileSplitter, SplitConfig, FileType};
 pub use model_runner::ModelRunner;
 pub use job_processor::{
-    JobProcessor, JobConfig
+    JobProcessor, 
+    JobConfig, 
+    FileChunkResult, 
+    JobResult, 
+    ProcessingMetadata, 
+    FileProcessingInfo,
+    MarkdownBuilder,
+    MarkdownFormatter
 };
