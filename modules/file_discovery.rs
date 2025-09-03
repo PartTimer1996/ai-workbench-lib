@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Result};
 use aws_sdk_s3::Client as S3Client;
 use std::collections::HashMap;
 use std::path::Path;
 use super::file_splitter::types::FileType;
-use tracing::info;
+use tracing::{info, error, warn};
 
 /// Handles discovery and processing of multiple files and folders
 pub struct FileDiscovery {
@@ -21,36 +21,111 @@ impl FileDiscovery {
     
     /// Discover all files to process from the input specification
     pub async fn discover_files(&self, input_spec: &str) -> Result<Vec<FileInfo>> {
-         if input_spec.ends_with('/') {
+        info!("=== FileDiscovery::discover_files DEBUG START ===");
+        info!("Input spec: '{}'", input_spec);
+        info!("Workspace bucket: '{}'", self.workspace_bucket);
+        
+        let result = if input_spec.ends_with('/') {
+            info!("Detected folder input (ends with '/') - processing as folder");
             // Folder specified
             self.process_folder(input_spec).await
         } else {
+            info!("Detected single file input (no trailing '/') - processing as single file");
             // Single file
             self.process_single_file(input_spec).await
+        };
+        
+        match &result {
+            Ok(files) => {
+                info!("discover_files completed successfully with {} files", files.len());
+            },
+            Err(e) => {
+                error!("discover_files failed: {}", e);
+                error!("Error details: {:?}", e);
+            }
         }
+        
+        info!("=== FileDiscovery::discover_files DEBUG END ===");
+        result
     }
     
     /// Process a single file
     async fn process_single_file(&self, file_key: &str) -> Result<Vec<FileInfo>> {
-        let metadata = self.get_file_metadata(file_key).await?;
+        info!("=== process_single_file DEBUG START ===");
+        info!("Processing single file: '{}'", file_key);
+        info!("Full S3 path: s3://{}/{}", self.workspace_bucket, file_key);
         
-        Ok(vec![FileInfo {
+        info!("Attempting to get file metadata...");
+        let metadata_result = self.get_file_metadata(file_key).await;
+        
+        let metadata = match metadata_result {
+            Ok(meta) => {
+                info!("Metadata retrieved successfully:");
+                info!("  - Size: {} bytes", meta.size_bytes);
+                info!("  - File type: {:?}", meta.file_type);
+                info!("  - Is processable: {}", meta.is_processable);
+                
+                if !meta.is_processable {
+                    error!("File '{}' is not processable! Reasons:", file_key);
+                    error!("  - File type: {:?}", meta.file_type);
+                    error!("  - Size: {} bytes", meta.size_bytes);
+                    if meta.size_bytes == 0 {
+                        error!("  - File is empty (0 bytes)");
+                    }
+                    if matches!(meta.file_type, super::file_splitter::types::FileType::Binary) {
+                        error!("  - File is binary type");
+                        if meta.size_bytes > 100 * 1024 * 1024 {
+                            error!("  - File is too large (> 100MB)");
+                        }
+                    }
+                    return Err(anyhow::anyhow!("File '{}' is not processable", file_key));
+                }
+                
+                meta
+            },
+            Err(e) => {
+                error!("Failed to get metadata for file '{}': {}", file_key, e);
+                error!("This usually means:");
+                error!("  1. File does not exist at s3://{}/{}", self.workspace_bucket, file_key);
+                error!("  2. No permissions to access the file");
+                error!("  3. S3 service is unavailable");
+                error!("  4. Incorrect bucket name or file path");
+                return Err(e.context(format!("Failed to get metadata for single file: {}", file_key)));
+            }
+        };
+        
+        let file_info = FileInfo {
             s3_key: file_key.to_string(),
             relative_path: file_key.to_string(),
             size_bytes: metadata.size_bytes,
             file_type: metadata.file_type,
-        }])
+        };
+        
+        info!("Single file processed successfully:");
+        info!("  - S3 key: '{}'", file_info.s3_key);
+        info!("  - Relative path: '{}'", file_info.relative_path);
+        info!("  - Size: {} bytes", file_info.size_bytes);
+        info!("  - Type: {:?}", file_info.file_type);
+        info!("=== process_single_file DEBUG END (SUCCESS) ===");
+        
+        Ok(vec![file_info])
     }
     
     
     /// Process a folder (recursively discover all files)
     async fn process_folder(&self, folder_prefix: &str) -> Result<Vec<FileInfo>> {
-        info!("Discovering files in folder: s3://{}/{}", self.workspace_bucket, folder_prefix);
+        info!("=== process_folder DEBUG START ===");
+        info!("Processing folder: '{}'", folder_prefix);
+        info!("Full S3 path: s3://{}/{}", self.workspace_bucket, folder_prefix);
         
         let mut files = Vec::new();
         let mut continuation_token: Option<String> = None;
+        let mut request_count = 0;
         
         loop {
+            request_count += 1;
+            info!("Making S3 ListObjects request #{}", request_count);
+            
             let mut request = self.s3_client
                 .list_objects_v2()
                 .bucket(&self.workspace_bucket)
@@ -58,66 +133,174 @@ impl FileDiscovery {
                 .max_keys(1000);
                 
             if let Some(token) = &continuation_token {
+                info!("Using continuation token: {}", token);
                 request = request.continuation_token(token);
             }
             
-            let response = request.send().await
-                .context("Failed to list objects in S3")?;
+            info!("Sending ListObjectsV2 request to S3...");
+            let response_result = request.send().await;
+            
+            let response = match response_result {
+                Ok(resp) => {
+                    info!("S3 ListObjectsV2 request #{} successful!", request_count);
+                    resp
+                },
+                Err(e) => {
+                    error!("S3 ListObjectsV2 request failed: {}", e);
+                    error!("Error details: {:?}", e);
+                    error!("Possible causes:");
+                    error!("  1. Folder/prefix '{}' does not exist in bucket '{}'", folder_prefix, self.workspace_bucket);
+                    error!("  2. No list permissions for this bucket/prefix");
+                    error!("  3. AWS credentials are invalid or expired");
+                    error!("  4. Bucket '{}' does not exist", self.workspace_bucket);
+                    error!("  5. Network connectivity issues");
+                    return Err(anyhow::anyhow!("S3 ListObjectsV2 failed for folder '{}': {}", folder_prefix, e)
+                        .context("Failed to list objects in S3"));
+                }
+            };
             
             let objects = response.contents();
+            info!("Found {} objects in this batch", objects.len());
             
-            for object in objects {
+            if objects.is_empty() {
+                warn!("No objects found in folder '{}' - this might be expected if folder is empty", folder_prefix);
+            }
+            
+            for (i, object) in objects.iter().enumerate() {
                 let key = object.key().unwrap_or_default();
+                info!("Processing object {}: '{}'", i + 1, key);
                 
                 // Skip directories (keys ending with /)
                 if key.ends_with('/') {
+                    info!("  Skipping directory: '{}'", key);
                     continue;
                 }
                 
+                info!("  Creating metadata for file: '{}'", key);
                 let metadata = FileMetadata::from_s3_object(object, key);
+                info!("  File metadata: size={} bytes, type={:?}, processable={}", 
+                     metadata.size_bytes, metadata.file_type, metadata.is_processable);
                 
                 if metadata.is_processable {
-                    files.push(FileInfo {
+                    let relative_path = key.strip_prefix(folder_prefix).unwrap_or(key).to_string();
+                    let file_info = FileInfo {
                         s3_key: key.to_string(),
-                        relative_path: key.strip_prefix(folder_prefix).unwrap_or(key).to_string(),
+                        relative_path: relative_path.clone(),
                         size_bytes: metadata.size_bytes,
                         file_type: metadata.file_type,
-                    });
+                    };
+                    
+                    info!("  Adding processable file: '{}' (relative: '{}')", key, relative_path);
+                    files.push(file_info);
                 } else {
-                    info!("Skipping non-processable file: {}", key);
+                    info!("  Skipping non-processable file: '{}' (size={}, type={:?})", 
+                         key, metadata.size_bytes, metadata.file_type);
                 }
             }
             
             continuation_token = response.next_continuation_token().map(|s| s.to_string());
-            if continuation_token.is_none() {
+            if let Some(ref token) = continuation_token {
+                info!("More objects available, continuing with token: {}", token);
+            } else {
+                info!("No more objects to fetch, finishing folder processing");
                 break;
             }
         }
         
-        info!("Discovered {} processable files in folder", files.len());
+        info!("Folder processing completed: {} processable files found", files.len());
+        if files.is_empty() {
+            warn!("No processable files found in folder '{}'", folder_prefix);
+            warn!("This could mean:");
+            warn!("  1. Folder is empty");
+            warn!("  2. All files are binary/non-processable");
+            warn!("  3. All files are empty (0 bytes)");
+            warn!("  4. All files are too large (> 100MB for binary files)");
+        }
+        
+        info!("=== process_folder DEBUG END ===");
         Ok(files)
     }
     
     /// Get metadata for a single file
     async fn get_file_metadata(&self, file_key: &str) -> Result<FileMetadata> {
-        let response = self.s3_client
+        info!("=== get_file_metadata DEBUG START ===");
+        info!("Getting metadata for file: '{}'", file_key);
+        info!("Bucket: '{}'", self.workspace_bucket);
+        info!("Full S3 path: s3://{}/{}", self.workspace_bucket, file_key);
+        
+        info!("Sending HEAD request to S3...");
+        let response_result = self.s3_client
             .head_object()
             .bucket(&self.workspace_bucket)
             .key(file_key)
             .send()
-            .await
-            .context(format!("Failed to get metadata for {}", file_key))?;
+            .await;
+        
+        let response = match response_result {
+            Ok(resp) => {
+                info!("S3 HEAD request successful!");
+                info!("Response metadata:");
+                if let Some(content_length) = resp.content_length() {
+                    info!("  - Content length: {} bytes", content_length);
+                } else {
+                    warn!("  - No content length in response");
+                }
+                if let Some(content_type) = resp.content_type() {
+                    info!("  - Content type: {}", content_type);
+                } else {
+                    info!("  - No content type specified");
+                }
+                if let Some(last_modified) = resp.last_modified() {
+                    info!("  - Last modified: {:?}", last_modified);
+                }
+                resp
+            },
+            Err(e) => {
+                error!("S3 HEAD request failed for '{}': {}", file_key, e);
+                error!("Error details: {:?}", e);
+                error!("Possible causes:");
+                error!("  1. File '{}' does not exist in bucket '{}'", file_key, self.workspace_bucket);
+                error!("  2. No read permissions for this file/bucket");
+                error!("  3. AWS credentials are invalid or expired");
+                error!("  4. Network connectivity issues");
+                error!("  5. S3 service is temporarily unavailable");
+                return Err(anyhow::anyhow!("S3 HEAD request failed for '{}': {}", file_key, e)
+                    .context(format!("Failed to get metadata for {}", file_key)));
+            }
+        };
         
         let size_bytes = response.content_length().unwrap_or(0) as usize;
         let path = Path::new(file_key);
         let file_type = super::file_splitter::types::FileType::from_extension(path);
         let is_processable = Self::is_file_processable(&file_type, size_bytes);
         
-        Ok(FileMetadata {
+        info!("File metadata analysis:");
+        info!("  - Raw size from S3: {} bytes", size_bytes);
+        info!("  - File path for type detection: {:?}", path);
+        info!("  - Detected file type: {:?}", file_type);
+        info!("  - Is processable: {}", is_processable);
+        
+        if !is_processable {
+            info!("File is not processable because:");
+            if size_bytes == 0 {
+                info!("  - File is empty (0 bytes)");
+            }
+            if matches!(file_type, super::file_splitter::types::FileType::Binary) {
+                info!("  - File type is Binary (not text-based)");
+                if size_bytes > 100 * 1024 * 1024 {
+                    info!("  - Binary file is too large (> 100MB): {} bytes", size_bytes);
+                }
+            }
+        }
+        
+        let metadata = FileMetadata {
             size_bytes,
             file_type,
             is_processable,
-        })
+        };
+        
+        info!("=== get_file_metadata DEBUG END (SUCCESS) ===");
+        Ok(metadata)
     }
     
     /// Check if a file should be processed based on type and size

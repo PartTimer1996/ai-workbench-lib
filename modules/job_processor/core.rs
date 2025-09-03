@@ -86,18 +86,49 @@ impl JobProcessor {
     // === File Discovery and Management ===
     /// Discovers all files to process based on the input specification
     pub async fn discover_files(&self) -> Result<Vec<FileInfo>> {
+        info!("=== FILE DISCOVERY DEBUG START ===");
+        info!("Input specification: '{}'", self.config.input_spec);
+        info!("Workspace bucket: '{}'", self.config.workspace_bucket);
+        info!("Full S3 path would be: s3://{}/{}", self.config.workspace_bucket, self.config.input_spec);
+        
         let file_discovery = FileDiscovery::new(
             (*self.s3_client).clone(),
             self.config.workspace_bucket.clone()
         );
         
-        let files = file_discovery.discover_files(&self.config.input_spec).await?;
+        info!("FileDiscovery instance created successfully");
+        info!("Attempting to discover files...");
+        
+        let files_result = file_discovery.discover_files(&self.config.input_spec).await;
+        
+        match &files_result {
+            Ok(files) => {
+                info!("File discovery succeeded! Found {} files", files.len());
+                for (i, file) in files.iter().enumerate() {
+                    info!("  File {}: s3_key='{}', relative_path='{}', size={} bytes, type={:?}",
+                          i + 1, file.s3_key, file.relative_path, file.size_bytes, file.file_type);
+                }
+            },
+            Err(e) => {
+                error!("File discovery failed with error: {}", e);
+                error!("Error context: {:?}", e);
+                info!("=== FILE DISCOVERY DEBUG END (FAILED) ===");
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        }
+        
+        let files = files_result?;
         
         if files.is_empty() {
+            error!("File discovery returned empty list!");
+            error!("This means no processable files were found in: '{}'", self.config.input_spec);
+            error!("Bucket: '{}'", self.config.workspace_bucket);
+            info!("=== FILE DISCOVERY DEBUG END (EMPTY) ===");
             return Err(anyhow::anyhow!("No processable files found in: {}", self.config.input_spec));
         }
         
-        info!("Discovered {} files for processing", files.len());
+        info!("File discovery completed successfully with {} files", files.len());
+        info!("=== FILE DISCOVERY DEBUG END (SUCCESS) ===");
         Ok(files)
     }
 
@@ -612,18 +643,23 @@ mod job_processor_tests {
 
     #[tokio::test]
     async fn test_job_processor_single_file_end_to_end() {
+        // Initialize tracing for debugging
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+            
         let s3_client = Arc::new(create_test_s3_client().await);
         let bedrock_client = Arc::new(create_test_bedrock_client().await);
         let bucket = get_test_bucket();
-        let model_id: String = "amazon.nova-micro-v1:0".into();
+        let model_id: String = "meta.llama3-8b-instruct-v1:0".into();
         
         // Test with a single file (you'll provide this)
-        let test_file_key = "process_folder/sample.txt";
+        let test_file_key = "text_files/0c472776-7c22-464b-93bf-3714fd229b01.txt";
         let job_id = format!("test-single-{}", Uuid::new_v4());
         
         let config = JobConfig {
             job_id: job_id.clone(),
-            prompt: "Please analyze this file content and provide insights about the text. Focus on key themes and important information.".to_string(),
+            prompt: "Extract and analyze key information from this document:\n1. Main topics and themes\n2. Key facts and figures\n3. Action items or requirements\n4. Structured summary\n\nDocument:\n{{file}}".to_string(),
             workspace_bucket: bucket.clone(),
             input_spec: test_file_key.to_string(),
             output_prefix: "test-results/".to_string(),
@@ -638,6 +674,45 @@ mod job_processor_tests {
         let processor = JobProcessor::new(s3_client.clone(), bedrock_client, config);
         
         println!("Testing single file processing for: {}", test_file_key);
+        
+        // Test each step individually for better debugging
+        println!("Step 1: Testing file discovery...");
+        let files_result = processor.discover_files().await;
+        match &files_result {
+            Ok(files) => {
+                println!("✅ Found {} files", files.len());
+                for (i, file) in files.iter().enumerate() {
+                    println!("  File {}: {} ({} bytes)", i+1, file.relative_path, file.size_bytes);
+                }
+            }
+            Err(e) => {
+                println!("❌ File discovery failed: {}", e);
+                return; // Exit early if file discovery fails
+            }
+        }
+        
+        let files = files_result.unwrap();
+        
+        println!("Step 2: Testing single file processing...");
+        if let Some(first_file) = files.first() {
+            match processor.process_single_file(first_file).await {
+                Ok(results) => {
+                    println!("✅ Successfully processed file with {} chunks", results.len());
+                    for (i, chunk_result) in results.iter().enumerate() {
+                        println!("  Chunk {}: {} -> {} chars output", 
+                                i+1, 
+                                chunk_result.chunk_id, 
+                                chunk_result.output.len());
+                    }
+                }
+                Err(e) => {
+                    println!("❌ Single file processing failed: {}", e);
+                    return;
+                }
+            }
+        }
+        
+        println!("Step 3: Running full job processor...");
         
         match processor.run().await {
             Ok(output_key) => {

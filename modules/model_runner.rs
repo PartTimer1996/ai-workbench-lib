@@ -51,6 +51,10 @@ impl ModelRunner {
         let response_body: Value = serde_json::from_slice(&response.body().as_ref())
             .context("Failed to parse Bedrock response")?;
 
+        // Log the raw response for debugging
+        info!("Bedrock response for model {}: {}", model_id, 
+              serde_json::to_string_pretty(&response_body).unwrap_or_else(|_| "Could not serialize response".to_string()));
+
         // Extract output and token usage
         let output = self.extract_output(model_id, &response_body)?;
         let tokens_used = self.extract_token_usage(&response_body);
@@ -162,6 +166,15 @@ impl ModelRunner {
                     "top_p": 0.9
                 })
             }
+            // Meta Llama models (working in eu-west-2)
+            id if id.starts_with("meta.llama") => {
+                json!({
+                    "prompt": prompt,
+                    "max_gen_len": max_tokens,
+                    "temperature": 0.1,
+                    "top_p": 0.9
+                })
+            }
             // Fallback for older Claude models
             id if id.starts_with("anthropic.claude") => {
                 json!({
@@ -213,6 +226,13 @@ impl ModelRunner {
             // Mistral models (working in eu-west-2)
             id if id.starts_with("mistral.") => {
                 response_body["outputs"][0]["text"]
+                    .as_str()
+                    .unwrap_or("No content generated")
+                    .to_string()
+            }
+            // Meta Llama models (working in eu-west-2)
+            id if id.starts_with("meta.llama") => {
+                response_body["generation"]
                     .as_str()
                     .unwrap_or("No content generated")
                     .to_string()
