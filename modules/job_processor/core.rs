@@ -15,14 +15,14 @@ use tokio::io::AsyncReadExt;
 use tracing::{error, info, warn};
 
 use crate::{FileDiscovery, FileInfo, FileSplitter, SplitConfig, ModelRunner, FileType};
-use super::markdown::{MarkdownBuilder, MarkdownFormatter};
+use crate::modules::model_runner::TokenUsage;
+use super::markdown::MarkdownFormatter;
 use super::types::{JobConfig, FileChunkResult, JobResult, ProcessingMetadata, FileProcessingInfo};
 
 // Constants
 const DEFAULT_CHUNK_SIZE_MB: f64 = 5.0;
 const DEFAULT_MAX_PARALLEL: usize = 4;
 const DEFAULT_MAX_TOKENS: u32 = 4000;
-const COST_PER_TOKEN_ESTIMATE: f64 = 0.00001;
 const MIN_CHUNK_RATIO: f64 = 0.1;
 
 /// Main processor for handling AI-powered file analysis jobs
@@ -216,22 +216,19 @@ impl JobProcessor {
             .context(format!("Failed to process chunk {} for file {}", chunk_id, file_info.relative_path))?;
 
         info!("File: {}, chunk {} processed successfully, {} tokens used", 
-              file_info.relative_path, chunk_id, tokens_used.unwrap_or(0));
+              file_info.relative_path, chunk_id, 
+              tokens_used.as_ref().map(|t| t.total_tokens).unwrap_or(0));
 
         Ok(FileChunkResult {
             file_path: file_info.relative_path.clone(),
             chunk_id,
             output,
-            tokens_used,
-            cost_estimate: self.calculate_cost_estimate(tokens_used),
+            tokens_used: tokens_used.clone(),
+            cost_estimate: ModelRunner::calculate_cost_estimate(tokens_used, &self.config.model_id),
             file_type: format!("{:?}", file_info.file_type),
         })
     }
 
-    /// Calculates cost estimate based on token usage
-    fn calculate_cost_estimate(&self, tokens_used: Option<u32>) -> Option<f64> {
-        tokens_used.map(|t| t as f64 * COST_PER_TOKEN_ESTIMATE)
-    }
 
     /// Processes all chunks for a single file with controlled concurrency
     async fn process_file_chunks(&self, file_info: &FileInfo, chunks: Vec<Vec<u8>>) -> Result<Vec<FileChunkResult>> {
@@ -287,12 +284,12 @@ impl JobProcessor {
     // === Summary Generation ===
 
     /// Generates a comprehensive final summary using the AI model
-    async fn generate_final_summary(&self, combined_content: &str) -> Result<(String, Option<u32>)> {
+    async fn generate_final_summary(&self, combined_content: &str) -> Result<(String, Option<TokenUsage>)> {
         info!("Generating final summary through model analysis");
         
         if combined_content.trim().is_empty() {
             warn!("No content provided for summary generation");
-            return Ok(("No content available for summary".to_string(), Some(0)));
+            return Ok(("No content available for summary".to_string(), None));
         }
 
         let summary_prompt = self.create_summary_prompt(combined_content);
@@ -302,7 +299,8 @@ impl JobProcessor {
             .await
             .context("Failed to generate final summary")?;
 
-        info!("Final summary generated, {} tokens used", tokens_used.unwrap_or(0));
+        info!("Final summary generated, {} tokens used", 
+              tokens_used.as_ref().map(|t| t.total_tokens).unwrap_or(0));
         Ok((summary, tokens_used))
     }
 
@@ -428,29 +426,29 @@ impl JobProcessor {
     }
 
     /// Creates a comprehensive job result with aggregated statistics
-    fn create_job_result(&self, results: &[FileChunkResult], final_summary_tokens: Option<u32>, 
+    fn create_job_result(&self, results: &[FileChunkResult], final_summary_tokens: Option<&TokenUsage>, 
                         processing_time_ms: u64, files_summary: &str) -> JobResult {
-        let total_tokens: u32 = results.iter().filter_map(|r| r.tokens_used).sum();
+        let total_tokens: u32 = results.iter().filter_map(|r| r.tokens_used.as_ref()).map(|t| t.total_tokens).sum();
         let total_cost: f64 = results.iter().filter_map(|r| r.cost_estimate).sum();
         let unique_files: HashSet<_> = results.iter().map(|r| &r.file_path).collect();
-        let final_tokens = final_summary_tokens.unwrap_or(0);
+        let final_tokens = final_summary_tokens.map(|t| t.total_tokens).unwrap_or(0);
 
         JobResult {
             job_id: self.config.job_id.clone(),
-            output_s3_key: self.generate_output_key("md"),
+            output_s3_key: self.generate_output_key("result","md"),
             total_files_processed: unique_files.len(),
             total_chunks: results.len(),
             total_tokens: Some(total_tokens + final_tokens),
             total_cost: Some(total_cost),
             processing_time_ms,
             files_summary: files_summary.to_string(),
-            final_summary_tokens,
+            final_summary_tokens: final_summary_tokens.map(|t| t.total_tokens),
         }
     }
 
     /// Generates consistent S3 keys for different output formats
-    fn generate_output_key(&self, extension: &str) -> String {
-        format!("{}{}.{}", self.config.output_prefix, self.config.job_id, extension)
+    fn generate_output_key(&self, file_name: &str, extension: &str) -> String {
+        format!("{}{}.{}", self.config.output_prefix, file_name, extension)
     }
 
     fn create_processing_metadata(&self, files: &[FileInfo], results: &[FileChunkResult], processing_time_ms: u64) -> ProcessingMetadata {
@@ -465,6 +463,20 @@ impl JobProcessor {
                 .filter(|r| r.file_path == file.relative_path)
                 .collect();
             
+            // Calculate per-file totals
+            let file_input_tokens: u32 = file_results.iter()
+                .filter_map(|r| r.tokens_used.as_ref())
+                .map(|t| t.input_tokens)
+                .sum();
+            let file_output_tokens: u32 = file_results.iter()
+                .filter_map(|r| r.tokens_used.as_ref())
+                .map(|t| t.output_tokens)
+                .sum();
+            let file_total_tokens = file_input_tokens + file_output_tokens;
+            let file_cost: f64 = file_results.iter()
+                .filter_map(|r| r.cost_estimate)
+                .sum();
+            
             FileProcessingInfo {
                 file_path: file.relative_path.clone(),
                 file_size_bytes: file.size_bytes,
@@ -472,8 +484,26 @@ impl JobProcessor {
                 chunks_created: file_results.len(),
                 processing_successful: !file_results.is_empty(),
                 error_message: None,
+                input_tokens: file_input_tokens,
+                output_tokens: file_output_tokens,
+                total_tokens: file_total_tokens,
+                cost_estimate: if file_cost > 0.0 { Some(file_cost) } else { None },
             }
         }).collect();
+
+        // Calculate overall totals
+        let total_input_tokens: u32 = results.iter()
+            .filter_map(|r| r.tokens_used.as_ref())
+            .map(|t| t.input_tokens)
+            .sum();
+        let total_output_tokens: u32 = results.iter()
+            .filter_map(|r| r.tokens_used.as_ref())
+            .map(|t| t.output_tokens)
+            .sum();
+        let total_tokens = total_input_tokens + total_output_tokens;
+        let total_cost: f64 = results.iter()
+            .filter_map(|r| r.cost_estimate)
+            .sum();
 
         ProcessingMetadata {
             job_id: self.config.job_id.clone(),
@@ -482,7 +512,11 @@ impl JobProcessor {
             total_files: files.len(),
             files_processed,
             errors: Vec::new(),
-            processing_time_ms
+            processing_time_ms,
+            total_input_tokens,
+            total_output_tokens,
+            total_tokens,
+            total_cost: if total_cost > 0.0 { Some(total_cost) } else { None },
         }
     }
 
@@ -504,48 +538,7 @@ impl JobProcessor {
         Ok(())
     }
 
-    /// Formats the analysis results as well-structured Markdown using the builder
-    fn format_as_markdown(&self, files_summary: &str, 
-                         file_groups: &HashMap<String, Vec<&FileChunkResult>>, 
-                         final_summary: &str) -> String {
-        let mut builder = MarkdownBuilder::new();
-        
-        // Header with job metadata
-        builder
-            .heading(1, "File Analysis Results")
-            .metadata("Job ID", &self.config.job_id)
-            .metadata("Model", &self.config.model_id)
-            .paragraph("");
-        
-        // Processing summary
-        let clean_summary = MarkdownFormatter::clean_processing_summary(files_summary);
-        builder
-            .heading(2, "Processing Summary")
-            .paragraph(&clean_summary)
-            .horizontal_rule();
-        
-        // Individual file analyses
-        MarkdownFormatter::add_file_analyses(&mut builder, file_groups);
-        
-        // Final summary
-        if !final_summary.trim().is_empty() {
-            builder
-                .emoji_heading(1, "📊", "Final Analysis Summary")
-                .paragraph(final_summary);
-        }
-        
-        // Footer
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-            
-        builder
-            .horizontal_rule()
-            .paragraph(&format!("*Analysis completed: Unix timestamp {}*", timestamp));
-        
-        builder.build()
-    }
+
 
     /// Orchestrates the complete result upload process with multiple formats
     async fn upload_results(&self, results: &[FileChunkResult], files_summary: &str, 
@@ -561,14 +554,14 @@ impl JobProcessor {
         
         // Create all output formats
         let combined_output = self.generate_combined_output(&file_groups, files_summary, &final_summary);
-        let markdown_content = self.format_as_markdown(files_summary, &file_groups, &final_summary);
-        let job_result = self.create_job_result(results, final_summary_tokens, processing_time_ms, files_summary);
+        let markdown_content = MarkdownFormatter::format_as_markdown(&self.config, files_summary, &file_groups, &final_summary);
+        let job_result = self.create_job_result(results, final_summary_tokens.as_ref(), processing_time_ms, files_summary);
         let metadata = self.create_processing_metadata(files, results, processing_time_ms);
 
         // Generate S3 keys
-        let output_key = self.generate_output_key("md");
-        let json_key = self.generate_output_key("json");
-        let metadata_key = format!("{}metadata_{}.json", self.config.output_prefix, self.config.job_id);
+        let output_key = self.generate_output_key("result","md");
+        let json_key = self.generate_output_key("result","json");
+        let metadata_key = format!("{}metadata.json", self.config.output_prefix);
 
         // Upload all formats in parallel
         let markdown_upload = self.upload_to_s3(&output_key, markdown_content.into_bytes(), "text/markdown");
@@ -645,13 +638,13 @@ mod job_processor_tests {
     async fn test_job_processor_single_file_end_to_end() {
         // Initialize tracing for debugging
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .try_init();
             
         let s3_client = Arc::new(create_test_s3_client().await);
         let bedrock_client = Arc::new(create_test_bedrock_client().await);
         let bucket = get_test_bucket();
-        let model_id: String = "meta.llama3-8b-instruct-v1:0".into();
+        let model_id: String = "amazon.nova-micro-v1:0".into();
         
         // Test with a single file (you'll provide this)
         let test_file_key = "text_files/0c472776-7c22-464b-93bf-3714fd229b01.txt";
@@ -662,7 +655,7 @@ mod job_processor_tests {
             prompt: "Extract and analyze key information from this document:\n1. Main topics and themes\n2. Key facts and figures\n3. Action items or requirements\n4. Structured summary\n\nDocument:\n{{file}}".to_string(),
             workspace_bucket: bucket.clone(),
             input_spec: test_file_key.to_string(),
-            output_prefix: "test-results/".to_string(),
+            output_prefix: format!("result/{}/", job_id.clone()),
             model_id,
             workspace_id: "test-workspace".to_string(),
             user_id: "test-user".to_string(),

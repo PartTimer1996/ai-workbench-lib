@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::JobConfig;
+
 use super::types::FileChunkResult;
 
 /// A builder for creating structured markdown documents
@@ -65,6 +67,50 @@ impl Default for MarkdownBuilder {
 pub struct MarkdownFormatter;
 
 impl MarkdownFormatter {
+
+    /// Formats the analysis results as well-structured Markdown using the builder
+    pub fn format_as_markdown(config: &JobConfig, files_summary: &str, 
+                         file_groups: &HashMap<String, Vec<&FileChunkResult>>, 
+                         final_summary: &str) -> String {
+        let mut builder = MarkdownBuilder::new();
+        
+        // Header with job metadata
+        builder
+            .heading(1, "File Analysis Results")
+            .metadata("Job ID", &config.job_id)
+            .metadata("Model", &config.model_id)
+            .paragraph("");
+        
+        // Processing summary
+        let clean_summary = MarkdownFormatter::clean_processing_summary(files_summary);
+        builder
+            .heading(2, "Processing Summary")
+            .paragraph(&clean_summary)
+            .horizontal_rule();
+        
+        // Individual file analyses
+        MarkdownFormatter::add_file_analyses(&mut builder, file_groups);
+        
+        // Final summary
+        if !final_summary.trim().is_empty() {
+            builder
+                .emoji_heading(1, "📊", "Final Analysis Summary")
+                .paragraph(final_summary);
+        }
+        
+        // Footer
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+            
+        builder
+            .horizontal_rule()
+            .paragraph(&format!("*Analysis completed: Unix timestamp {}*", timestamp));
+        
+        builder.build()
+    }
+
     /// Formats file analyses section in markdown
     pub fn add_file_analyses(builder: &mut MarkdownBuilder, 
                             file_groups: &HashMap<String, Vec<&FileChunkResult>>) {
@@ -88,7 +134,7 @@ impl MarkdownFormatter {
                 if file_results.len() > 1 {
                     builder.heading(3, &format!("Chunk {} (Tokens: {})", 
                                                result.chunk_id + 1, 
-                                               result.tokens_used.unwrap_or(0)));
+                                               result.tokens_used.as_ref().map(|t| t.total_tokens).unwrap_or(0)));
                 }
                 
                 let cleaned_output = Self::clean_ai_output(&result.output);

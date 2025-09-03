@@ -1,8 +1,29 @@
 use anyhow::{Context, Result};
 use aws_sdk_bedrockruntime::{primitives::Blob, Client as BedrockClient};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tracing::info;
+
+#[derive(Debug, Clone)]
+pub struct ModelPricing {
+    pub input: f64,
+    pub output: f64,
+}
+
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+}
+
+impl std::fmt::Display for TokenUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} total ({} input, {} output)", 
+               self.total_tokens, self.input_tokens, self.output_tokens)
+    }
+}
 
 pub struct ModelRunner {
     bedrock_client: Arc<BedrockClient>,
@@ -14,7 +35,7 @@ impl ModelRunner {
     }
 
     /// Invoke a Bedrock model with the given prompt and model configuration
-    pub async fn invoke_model(&self, model_id: &str, prompt: &str, max_tokens: u32) -> Result<(String, Option<u32>)> {
+    pub async fn invoke_model(&self, model_id: &str, prompt: &str, max_tokens: u32) -> Result<(String, Option<TokenUsage>)> {
         // Truncate if too long (rough token estimate: ~4 chars per token)
         let max_chars = 15000; // Leave room for response
         let truncated_prompt = if prompt.len() > max_chars {
@@ -59,7 +80,7 @@ impl ModelRunner {
         let output = self.extract_output(model_id, &response_body)?;
         let tokens_used = self.extract_token_usage(&response_body);
 
-        info!("Model {} invoked successfully, {} tokens used", model_id, tokens_used.unwrap_or(0));
+        info!("Model {:?} invoked successfully, {:?} tokens used", model_id, tokens_used.clone().unwrap());
 
         Ok((output, tokens_used))
     }
@@ -71,7 +92,7 @@ impl ModelRunner {
         file_content: &str, 
         analysis_prompt: &str, 
         max_tokens: u32
-    ) -> Result<(String, Option<u32>)> {
+    ) -> Result<(String, Option<TokenUsage>)> {
         // Log details about the inputs
         info!("invoke_model_with_file_content called:");
         info!("  - model_id: {}", model_id);
@@ -206,6 +227,40 @@ impl ModelRunner {
         }
     }
 
+    pub fn get_model_pricing() -> HashMap<&'static str, ModelPricing> {
+        let mut pricing = HashMap::new();
+        pricing.insert("amazon.nova-micro-v1:0", ModelPricing { input: 0.00035, output: 0.0014 });
+        pricing.insert("amazon.nova-lite-v1:0", ModelPricing { input: 0.0006, output: 0.0024 });
+        pricing.insert("amazon.nova-pro-v1:0", ModelPricing { input: 0.008, output: 0.032 });
+        pricing.insert("amazon.titan-text-lite-v1", ModelPricing { input: 0.0003, output: 0.0004 });
+        pricing.insert("amazon.titan-text-express-v1", ModelPricing { input: 0.0008, output: 0.0016 });
+        pricing.insert("anthropic.claude-3-haiku-20240307-v1:0", ModelPricing { input: 0.00025, output: 0.00125 });
+        pricing.insert("anthropic.claude-3-sonnet-20240229-v1:0", ModelPricing { input: 0.003, output: 0.015 });
+        pricing.insert("anthropic.claude-3-opus-20240229-v1:0", ModelPricing { input: 0.015, output: 0.075 });
+        pricing.insert("anthropic.claude-3-5-sonnet-20240620-v1:0", ModelPricing { input: 0.003, output: 0.015 });
+        pricing.insert("meta.llama3-8b-instruct-v1:0", ModelPricing { input: 0.0003, output: 0.0006 });
+        pricing.insert("meta.llama3-70b-instruct-v1:0", ModelPricing { input: 0.00265, output: 0.0035 });
+        pricing.insert("mistral.mistral-7b-instruct-v0:2", ModelPricing { input: 0.00015, output: 0.0002 });
+        pricing.insert("mistral.mixtral-8x7b-instruct-v0:1", ModelPricing { input: 0.00045, output: 0.0007 });
+        pricing.insert("mistral.mistral-large-2402-v1:0", ModelPricing { input: 0.004, output: 0.012 });
+        pricing.insert("cohere.command-text-v14", ModelPricing { input: 0.0015, output: 0.002 });
+        pricing.insert("cohere.command-light-text-v14", ModelPricing { input: 0.0003, output: 0.0006 });
+        pricing.insert("ai21.j2-mid-v1", ModelPricing { input: 0.0125, output: 0.0125 });
+        pricing.insert("ai21.j2-ultra-v1", ModelPricing { input: 0.0188, output: 0.0188 });
+        pricing
+    }
+
+        /// Calculates cost estimate based on token usage and model pricing
+    pub fn calculate_cost_estimate(token_usage: Option<TokenUsage>, model_id: &str) -> Option<f64> {
+        token_usage.and_then(|usage| {
+            let pricing_map = ModelRunner::get_model_pricing();
+            pricing_map.get(model_id).map(|pricing| {
+                (usage.input_tokens as f64 * pricing.input / 1000.0) + 
+                (usage.output_tokens as f64 * pricing.output / 1000.0)
+            })
+        })
+    }
+
     /// Extract output from response based on model type
     fn extract_output(&self, model_id: &str, response_body: &Value) -> Result<String> {
         let output = match model_id {
@@ -274,18 +329,45 @@ impl ModelRunner {
     }
 
     /// Extract token usage from response
-    fn extract_token_usage(&self, response_body: &Value) -> Option<u32> {
-        response_body["usage"]["total_tokens"]
-            .as_u64()
-            .or_else(|| {
-                response_body["amazon-bedrock-invocationMetrics"]["inputTokenCount"]
-                    .as_u64()
-                    .and_then(|input| {
-                        response_body["amazon-bedrock-invocationMetrics"]["outputTokenCount"]
-                            .as_u64()
-                            .map(|output| input + output)
-                    })
-            })
-            .map(|t| t as u32)
+    fn extract_token_usage(&self, response_body: &Value) -> Option<TokenUsage> {
+        // Try to extract separate input/output tokens first
+        if let (Some(input), Some(output)) = (
+            response_body["usage"]["inputTokens"].as_u64(),
+            response_body["usage"]["outputTokens"].as_u64(),
+        ) {
+            return Some(TokenUsage {
+                input_tokens: input as u32,
+                output_tokens: output as u32,
+                total_tokens: (input + output) as u32,
+            });
+        }
+
+        // Fallback to total tokens if available
+        if let Some(total) = response_body["usage"]["totalTokens"].as_u64()
+            .or_else(|| response_body["usage"]["total_tokens"].as_u64())
+        {
+            // When only total is available, assume 70% input / 30% output split as rough estimate
+            let input_estimate = (total as f64 * 0.7) as u32;
+            let output_estimate = total as u32 - input_estimate;
+            return Some(TokenUsage {
+                input_tokens: input_estimate,
+                output_tokens: output_estimate,
+                total_tokens: total as u32,
+            });
+        }
+
+        // Last resort: try Bedrock invocation metrics
+        if let (Some(input), Some(output)) = (
+            response_body["amazon-bedrock-invocationMetrics"]["inputTokenCount"].as_u64(),
+            response_body["amazon-bedrock-invocationMetrics"]["outputTokenCount"].as_u64(),
+        ) {
+            return Some(TokenUsage {
+                input_tokens: input as u32,
+                output_tokens: output as u32,
+                total_tokens: (input + output) as u32,
+            });
+        }
+
+        None
     }
 }

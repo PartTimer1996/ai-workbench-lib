@@ -1,6 +1,7 @@
 //! Types and data structures for the job processor module
 
 use serde::{Deserialize, Serialize};
+use crate::modules::model_runner::TokenUsage;
 
 /// Configuration for a processing job
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -24,7 +25,7 @@ pub struct FileChunkResult {
     pub file_path: String,
     pub chunk_id: usize,
     pub output: String,
-    pub tokens_used: Option<u32>,
+    pub tokens_used: Option<TokenUsage>,
     pub cost_estimate: Option<f64>,
     pub file_type: String,
 }
@@ -53,6 +54,10 @@ pub struct ProcessingMetadata {
     pub files_processed: Vec<FileProcessingInfo>,
     pub errors: Vec<String>,
     pub processing_time_ms: u64,
+    pub total_input_tokens: u32,
+    pub total_output_tokens: u32,
+    pub total_tokens: u32,
+    pub total_cost: Option<f64>,
 }
 
 /// Information about processing a single file
@@ -64,4 +69,8 @@ pub struct FileProcessingInfo {
     pub chunks_created: usize,
     pub processing_successful: bool,
     pub error_message: Option<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+    pub cost_estimate: Option<f64>,
 }
