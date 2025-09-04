@@ -205,12 +205,16 @@ impl JobProcessor {
         info!("Processing file: {}, chunk {} ({} bytes)", 
               file_info.relative_path, chunk_id, chunk_data.len());
 
+        let max_tokens = self.config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let (output, tokens_used) = self.model_runner
             .invoke_model_with_file_content(
                 &self.config.model_id, 
                 &text_content, 
                 &self.config.prompt, 
-                DEFAULT_MAX_TOKENS
+                max_tokens,
+                self.config.temperature,
+                self.config.top_p,
+                None // No stop sequences for file content processing
             )
             .await
             .context(format!("Failed to process chunk {} for file {}", chunk_id, file_info.relative_path))?;
@@ -294,8 +298,16 @@ impl JobProcessor {
 
         let summary_prompt = self.create_summary_prompt(combined_content);
 
+        let max_tokens = self.config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let (summary, tokens_used) = self.model_runner
-            .invoke_model(&self.config.model_id, &summary_prompt, DEFAULT_MAX_TOKENS)
+            .invoke_model(
+                &self.config.model_id, 
+                &summary_prompt, 
+                max_tokens,
+                self.config.temperature,
+                self.config.top_p,
+                None // No stop sequences for summary generation
+            )
             .await
             .context("Failed to generate final summary")?;
 
@@ -662,6 +674,9 @@ mod job_processor_tests {
             chunk_size_mb: Some(1.0),
             max_parallel: Some(2),
             include_file_context: Some(true),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
         };
 
         let processor = JobProcessor::new(s3_client.clone(), bedrock_client, config);
@@ -778,6 +793,9 @@ mod job_processor_tests {
             chunk_size_mb: Some(0.5), // Smaller chunks for testing
             max_parallel: Some(3),
             include_file_context: Some(true),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
         };
 
         let processor = JobProcessor::new(s3_client.clone(), bedrock_client, config);
@@ -873,6 +891,9 @@ mod job_processor_tests {
             chunk_size_mb: Some(0.1), // Very small chunks to force splitting
             max_parallel: Some(2),
             include_file_context: Some(true),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
         };
 
         let processor = JobProcessor::new(s3_client.clone(), bedrock_client, config);
@@ -948,6 +969,9 @@ mod job_processor_tests {
             chunk_size_mb: Some(1.0),
             max_parallel: Some(2),
             include_file_context: Some(true),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
         };
 
         let processor = JobProcessor::new(s3_client, bedrock_client, config);
@@ -997,6 +1021,9 @@ mod job_processor_tests {
                 chunk_size_mb: None,
                 max_parallel: None,
                 include_file_context: None,
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
             },
             // Full config
             JobConfig {
@@ -1011,6 +1038,9 @@ mod job_processor_tests {
                 chunk_size_mb: Some(2.0),
                 max_parallel: Some(5),
                 include_file_context: Some(false),
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
             },
         ];
         

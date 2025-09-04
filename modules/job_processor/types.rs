@@ -17,6 +17,9 @@ pub struct JobConfig {
     pub chunk_size_mb: Option<f64>,
     pub max_parallel: Option<usize>,
     pub include_file_context: Option<bool>, // Whether to include file path and type in prompts
+    pub max_tokens: Option<u32>, // Maximum tokens per request
+    pub temperature: Option<f64>, // Model temperature (0.0-1.0)
+    pub top_p: Option<f64>, // Top-p sampling parameter (0.0-1.0)
 }
 
 /// Result from processing a single file chunk

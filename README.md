@@ -99,7 +99,7 @@ use ai_workbench_lib::ModelRunner;
 
 let model_runner = ModelRunner::new(bedrock_client);
 let (response, tokens) = model_runner
-    .invoke_model("amazon.nova-micro-v1:0", "Your prompt here", 4000)
+    .invoke_model("amazon.nova-micro-v1:0", "Your prompt here", 4000, None, None, None)
     .await?;
 ```
 

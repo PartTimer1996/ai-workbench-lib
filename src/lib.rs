@@ -35,6 +35,9 @@
 //!         chunk_size_mb: Some(5.0),
 //!         max_parallel: Some(4),
 //!         include_file_context: Some(true),
+//!         max_tokens: Some(4000),
+//!         temperature: Some(0.1),
+//!         top_p: Some(0.9),
 //!     };
 //!     
 //!     // Create and run job processor

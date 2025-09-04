@@ -18,6 +18,49 @@ pub struct TokenUsage {
     pub total_tokens: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelParameters {
+    pub temperature: f64,
+    pub top_p: f64,
+    pub stop_sequences: Vec<String>,
+}
+
+impl Default for ModelParameters {
+    fn default() -> Self {
+        Self {
+            temperature: 0.1,
+            top_p: 0.9,
+            stop_sequences: Vec::new(),
+        }
+    }
+}
+
+impl ModelParameters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn temperature(mut self, temperature: f64) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    pub fn top_p(mut self, top_p: f64) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
+    pub fn stop_sequences(mut self, stop_sequences: Vec<String>) -> Self {
+        self.stop_sequences = stop_sequences;
+        self
+    }
+
+    pub fn add_stop_sequence(mut self, stop_sequence: String) -> Self {
+        self.stop_sequences.push(stop_sequence);
+        self
+    }
+}
+
 impl std::fmt::Display for TokenUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} total ({} input, {} output)", 
@@ -35,7 +78,20 @@ impl ModelRunner {
     }
 
     /// Invoke a Bedrock model with the given prompt and model configuration
-    pub async fn invoke_model(&self, model_id: &str, prompt: &str, max_tokens: u32) -> Result<(String, Option<TokenUsage>)> {
+    pub async fn invoke_model(
+        &self, 
+        model_id: &str, 
+        prompt: &str, 
+        max_tokens: u32,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        stop_sequences: Option<Vec<String>>
+    ) -> Result<(String, Option<TokenUsage>)> {
+        let params = ModelParameters {
+            temperature: temperature.unwrap_or(0.1),
+            top_p: top_p.unwrap_or(0.9),
+            stop_sequences: stop_sequences.unwrap_or_default(),
+        };
         // Truncate if too long (rough token estimate: ~4 chars per token)
         let max_chars = 15000; // Leave room for response
         let truncated_prompt = if prompt.len() > max_chars {
@@ -45,7 +101,7 @@ impl ModelRunner {
         };
 
         // Build request body based on model type
-        let request_body = self.build_request_body(model_id, &truncated_prompt, max_tokens);
+        let request_body = self.build_request_body(model_id, &truncated_prompt, max_tokens, &params);
         info!("Invoking model {} with {} character prompt", model_id, truncated_prompt.len());
         
         let response = self
@@ -91,13 +147,17 @@ impl ModelRunner {
         model_id: &str, 
         file_content: &str, 
         analysis_prompt: &str, 
-        max_tokens: u32
+        max_tokens: u32,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        stop_sequences: Option<Vec<String>>
     ) -> Result<(String, Option<TokenUsage>)> {
         // Log details about the inputs
         info!("invoke_model_with_file_content called:");
         info!("  - model_id: {}", model_id);
         info!("  - file_content length: {} chars", file_content.len());
         info!("  - analysis_prompt: {}", analysis_prompt);
+        info!("  - temperature: {:?}, top_p: {:?}, stop_sequences: {:?}", temperature, top_p, stop_sequences);
         info!("  - file_content preview (first 200 chars): {}", 
               &file_content.chars().take(200).collect::<String>());
         
@@ -107,8 +167,8 @@ impl ModelRunner {
         // Log the combined prompt length for debugging
         info!("Combined prompt length: {} chars", combined_prompt.len());
         
-        // Use the standard invoke_model with the combined prompt
-        self.invoke_model(model_id, &combined_prompt, max_tokens).await
+        // Use the updated invoke_model method
+        self.invoke_model(model_id, &combined_prompt, max_tokens, temperature, top_p, stop_sequences).await
     }
 
     /// Format a prompt that includes file content and analysis instructions
@@ -141,11 +201,11 @@ impl ModelRunner {
     }
 
     /// Build request body based on model type
-    fn build_request_body(&self, model_id: &str, prompt: &str, max_tokens: u32) -> Value {
+    fn build_request_body(&self, model_id: &str, prompt: &str, max_tokens: u32, params: &ModelParameters) -> Value {
         match model_id {
             // Amazon Nova models (working in eu-west-2)
             id if id.starts_with("amazon.nova") => {
-                json!({
+                let mut config = json!({
                     "messages": [
                         {
                             "role": "user",
@@ -158,70 +218,90 @@ impl ModelRunner {
                     ],
                     "inferenceConfig": {
                         "max_new_tokens": max_tokens,
-                        "temperature": 0.1,
-                        "top_p": 0.9
+                        "temperature": params.temperature,
+                        "top_p": params.top_p
                     }
-                })
+                });
+                if !params.stop_sequences.is_empty() {
+                    config["inferenceConfig"]["stop_sequences"] = json!(params.stop_sequences);
+                }
+                config
             }
             // Anthropic Claude 3 models (working in eu-west-2)
             id if id.starts_with("anthropic.claude-3") => {
-                json!({
+                let mut config = json!({
                     "anthropic_version": "bedrock-2023-05-31",
                     "max_tokens": max_tokens,
-                    "temperature": 0.1,
-                    "top_p": 0.9,
+                    "temperature": params.temperature,
+                    "top_p": params.top_p,
                     "messages": [
                         {
                             "role": "user",
                             "content": prompt
                         }
                     ]
-                })
+                });
+                if !params.stop_sequences.is_empty() {
+                    config["stop_sequences"] = json!(params.stop_sequences);
+                }
+                config
             }
             // Mistral models (working in eu-west-2)
             id if id.starts_with("mistral.") => {
-                json!({
+                let mut config = json!({
                     "prompt": prompt,
                     "max_tokens": max_tokens,
-                    "temperature": 0.1,
-                    "top_p": 0.9
-                })
+                    "temperature": params.temperature,
+                    "top_p": params.top_p
+                });
+                if !params.stop_sequences.is_empty() {
+                    config["stop"] = json!(params.stop_sequences);
+                }
+                config
             }
             // Meta Llama models (working in eu-west-2)
             id if id.starts_with("meta.llama") => {
                 json!({
                     "prompt": prompt,
                     "max_gen_len": max_tokens,
-                    "temperature": 0.1,
-                    "top_p": 0.9
+                    "temperature": params.temperature,
+                    "top_p": params.top_p
                 })
             }
             // Fallback for older Claude models
             id if id.starts_with("anthropic.claude") => {
-                json!({
+                let mut config = json!({
                     "prompt": format!("\n\nHuman: {}\n\nAssistant:", prompt),
                     "max_tokens_to_sample": max_tokens,
-                    "temperature": 0.1,
-                    "top_p": 0.9,
-                })
+                    "temperature": params.temperature,
+                    "top_p": params.top_p,
+                });
+                if !params.stop_sequences.is_empty() {
+                    config["stop_sequences"] = json!(params.stop_sequences);
+                }
+                config
             }
             // Amazon Titan models (if needed)
             id if id.starts_with("amazon.titan") => {
-                json!({
+                let mut config = json!({
                     "inputText": prompt,
                     "textGenerationConfig": {
                         "maxTokenCount": max_tokens,
-                        "temperature": 0.1,
-                        "topP": 0.9
+                        "temperature": params.temperature,
+                        "topP": params.top_p
                     }
-                })
+                });
+                if !params.stop_sequences.is_empty() {
+                    config["textGenerationConfig"]["stopSequences"] = json!(params.stop_sequences);
+                }
+                config
             }
             // Default format for any other models
             _ => {
                 json!({
                     "prompt": prompt,
                     "max_tokens": max_tokens,
-                    "temperature": 0.1
+                    "temperature": params.temperature
                 })
             }
         }
